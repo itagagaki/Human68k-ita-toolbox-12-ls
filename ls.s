@@ -6,7 +6,15 @@
 * Itagaki Fumihiko 06-Dec-92  Debug and brush up.
 * 1.1
 *
-* Usage: ls [ -1ABCDFLQRSUXabdeflmpqrstvx ] [ -w cols ] [ - ] [ file ] ...
+* Itagaki Fumihiko 08-Dec-92  ボリューム・ラベルのクラスタ数も正しく計数
+* Itagaki Fumihiko 16-Dec-92  / の最終更新時刻を 0-0-0 から 0-1-1 に変更
+* Itagaki Fumihiko 23-Dec-92  -V オプションの追加
+* Itagaki Fumihiko 10-Jan-93  GETPDB -> lea $10(a0),a0
+* Itagaki Fumihiko 20-Jan-93  引数 - と -- の扱いの変更
+* Itagaki Fumihiko 22-Jan-93  スタックを拡張
+* 1.2
+*
+* Usage: ls [ -1ABCDFGLQRSUVXabdeflmpqrstvx ] [ -w cols ] [ -- ] [ file ] ...
 *
 * オプションを追加するときは注意が必要。
 * あちらこちらでフラグをチェックして、無駄な処理を省いている。
@@ -34,7 +42,7 @@
 .xref strfor1
 .xref memmovi
 .xref memset
-.xref minmaxul
+.xref mulul
 .xref divul
 .xref bsltosl
 .xref strip_excessive_slashes
@@ -46,6 +54,7 @@
 
 REQUIRED_OSVER		equ	$200			*  2.00以降
 BLOCKSIZE		equ	1024
+OLDEST_DATIME		equ	((1<<5)|1)<<16
 
 MAXRECURSE	equ	64	*  サブディレクトリを検索するために再帰する回数の上限．
 				*  MAXDIR （パス名のディレクトリ部 "/1/2/3/../" の長さ）
@@ -65,6 +74,7 @@ entry_flag:	ds.b	1
 entry_mode:	ds.b	1
 entry_linkmode:	ds.b	1
 .even
+entry_drive:	ds.w	1
 entry_datime:
 entry_date:	ds.w	1
 entry_time:	ds.w	1
@@ -109,8 +119,7 @@ start1:
 		cmp.w	#REQUIRED_OSVER,d0
 		bcs	dos_version_mismatch
 
-		DOS	_GETPDB
-		movea.l	d0,a0				*  A0 : PDBアドレス
+		lea	$10(a0),a0			*  A0 : PDBアドレス
 		move.l	a7,d0
 		sub.l	a0,d0
 		move.l	d0,-(a7)
@@ -204,10 +213,19 @@ decode_opt_loop1:
 		cmpi.b	#'-',(a0)
 		bne	decode_opt_done
 
+		tst.b	1(a0)
+		beq	decode_opt_done
+
 		subq.l	#1,d7
 		addq.l	#1,a0
 		move.b	(a0)+,d0
+		cmp.b	#'-',d0
+		bne	decode_opt_loop2
+
+		tst.b	(a0)+
 		beq	decode_opt_done
+
+		subq.l	#1,a0
 decode_opt_loop2:
 		cmp.b	#'f',d0
 		beq	opt_f
@@ -217,6 +235,9 @@ decode_opt_loop2:
 
 		cmp.b	#'s',d0
 		beq	opt_s
+
+		cmp.b	#'V',d0
+		beq	opt_V
 
 		cmp.b	#'R',d0
 		beq	opt_R
@@ -235,6 +256,9 @@ decode_opt_loop2:
 
 		cmp.b	#'r',d0
 		beq	opt_r
+
+		cmp.b	#'G',d0
+		beq	opt_G
 
 		cmp.b	#'v',d0
 		beq	opt_v
@@ -407,8 +431,16 @@ opt_r:
 		st	reverse
 		bra	set_option_done
 
+opt_G:
+		st	gather
+		bra	set_option_done
+
 opt_s:
 		st	print_nblocks
+		bra	set_option_done
+
+opt_V:
+		st	virtual_dir_size
 set_option_done:
 		move.b	(a0)+,d0
 		bne	decode_opt_loop2
@@ -461,6 +493,17 @@ needs_dots_stat_ok:
 
 		sf	replace_link			*  -L に効果は無い。退ける。
 replace_link_ok:
+	*
+	*  -V の効果をチェックする
+	*
+		tst.b	long_format
+		bne	virtual_dir_size_ok
+
+		cmpi.l	#cmp_size,cmp_func
+		beq	virtual_dir_size_ok
+
+		sf	virtual_dir_size
+virtual_dir_size_ok:
 	*
 	*  ファイル引数を検査する
 	*
@@ -1210,7 +1253,7 @@ copy_stat:
 set_nostat:
 		move.b	#MODEVAL_DIR,entry_mode(a1)
 		bset.b	#FLAGBIT_NOSTAT,entry_flag(a1)
-		clr.l	entry_datime(a1)
+		move.l	#OLDEST_DATIME,entry_datime(a1)
 		clr.l	entry_size(a1)
 		clr.l	entry_nblocks(a1)
 		clr.b	entry_linkmode(a1)
@@ -1454,10 +1497,38 @@ test_subdir_bit_ok:
 *      D0.L   破壊
 *****************************************************************
 set_cluster_size:
+		move.b	entry_mode(a1),d0
+		btst	#MODEBIT_DIR,d0
+		beq	set_cluster_size_1
+
+		tst.b	virtual_dir_size
+		beq	set_cluster_size_1
+
+		bsr	calc_true_cluster_size
+		pea	dpbbuf(pc)
+		move.w	entry_drive(a1),-(a7)
+		DOS	_GETDPB
+		addq.l	#6,a7
+		tst.l	d0
+		bmi	set_virtual_dir_size_done
+
+		move.l	d1,-(a7)
+		moveq	#0,d0
+		move.w	dpbbuf+2,d0
+		move.b	dpbbuf+5,d1
+		lsl.l	d1,d0
+		move.l	entry_nblocks(a1),d1
+		bsr	mulul
+		move.l	(a7)+,d1
+		move.l	d0,entry_size(a1)
+set_virtual_dir_size_done:
+		rts
+
+set_cluster_size_1:
 		tst.b	needs_nblocks
 		beq	set_cluster_size_return
 
-		btst.b	#MODEBIT_DIR,entry_mode(a1)
+		and.b	#(MODEVAL_VOL|MODEVAL_DIR),d0
 		bne	calc_true_cluster_size
 
 		move.l	entry_size(a1),d0
@@ -1467,11 +1538,11 @@ set_cluster_size:
 		bra	do_set_cluster_size
 
 calc_true_cluster_size:
-		movem.l	d1-d2/a1,-(a7)
+		movem.l	d1-d2/a2,-(a7)
 		moveq	#0,d2
-		lea	fatchkbuf(pc),a1
+		lea	fatchkbuf(pc),a2
 		move.w	#2+8*FATCHK_STATIC+4,-(a7)
-		move.l	a1,d0
+		move.l	a2,d0
 		bset	#31,d0
 		move.l	d0,-(a7)
 		move.l	a0,-(a7)
@@ -1506,18 +1577,18 @@ fatchk_malloc_ok:
 		cmp.l	#EBADPARAM,d0
 		beq	insufficient_memory
 
-		movea.l	d2,a1
+		movea.l	d2,a2
 fatchk_success:
 		moveq	#0,d1
 		tst.l	d0
 		bmi	calc_cluster_size_done
 
-		addq.l	#2,a1
+		move.w	(a2)+,entry_drive(a1)
 calc_cluster_size_loop:
-		tst.l	(a1)+
+		tst.l	(a2)+
 		beq	calc_cluster_size_done
 
-		add.l	(a1)+,d1
+		add.l	(a2)+,d1
 		bra	calc_cluster_size_loop
 
 calc_cluster_size_done:
@@ -1527,7 +1598,7 @@ calc_cluster_size_done:
 		bsr	free
 cluster_size_ok:
 		move.l	d1,d0
-		movem.l	(a7)+,d1-d2/a1
+		movem.l	(a7)+,d1-d2/a2
 do_set_cluster_size:
 		move.l	d0,entry_nblocks(a1)
 set_cluster_size_return:
@@ -2378,7 +2449,8 @@ sjiswidth_1:
 *      A0, A1   ENTRY構造体のアドレス
 *
 * RETURN
-*      D0.L     比較結果
+*      CCR      比較結果
+*      D0.L     破壊
 ****************************************************************
 cmp_time:
 		move.l	entry_datime(a1),d0
@@ -2390,20 +2462,6 @@ cmp_size:
 		move.l	entry_size(a1),d0
 		sub.l	entry_size(a0),d0
 		beq	cmp_name
-		rts
-
-cmp_name:
-		tst.b	case_insensitive
-		beq	cmp_name_cs
-cmp_name_ci:
-		bsr	stricmp
-		bne	cmp_name_done
-cmp_name_cs:
-		bsr	strcmp
-cmp_name_done:
-		ext.w	d0
-		ext.l	d0
-cmp_return:
 		rts
 
 cmp_extention:
@@ -2418,12 +2476,20 @@ cmp_extention:
 		bsr	stricmp
 		movem.l	(a7)+,a0-a1
 		beq	cmp_name
-		bra	cmp_name_done
+		rts
 
 cmp_extention_cs:
 		bsr	cmp_name
 		movem.l	(a7)+,a0-a1
 		beq	cmp_name
+		rts
+
+cmp_name:
+		tst.b	case_insensitive
+		beq	strcmp
+
+		bsr	stricmp
+		beq	strcmp
 		rts
 *****************************************************************
 * sort - ENTRY構造体をソートする（ヒープ・ソート）
@@ -2436,7 +2502,7 @@ cmp_extention_cs:
 *      none
 *****************************************************************
 sort:
-		movem.l	d0-d4/a0-a6,-(a7)
+		movem.l	d0-d5/a0-a6,-(a7)
 		move.l	cmp_func,d1
 		beq	sort_done
 
@@ -2472,7 +2538,7 @@ sort_loop_2:
 		bra	sort_loop_2
 
 sort_done:
-		movem.l	(a7)+,d0-d4/a0-a6
+		movem.l	(a7)+,d0-d5/a0-a6
 		rts
 
 sort_add_to_heap:
@@ -2498,14 +2564,14 @@ sort_add_to_heap_1:
 		movea.l	(a5)+,a0
 		movea.l	(a5),a1
 		bsr	comp
-		bge	sort_add_to_heap_2
+		beq	sort_add_to_heap_2
 
 		addq.l	#1,d1
 		movea.l	a1,a0
 sort_add_to_heap_2:
 		movea.l	d4,a1
 		bsr	comp
-		blt	sort_add_to_heap_loop_break
+		bne	sort_add_to_heap_loop_break
 
 		move.l	a0,(a4)
 		bra	sort_add_to_heap_loop
@@ -2515,13 +2581,29 @@ sort_add_to_heap_loop_break:
 		rts
 
 comp:
-		jsr	(a2)
-		tst.b	reverse
-		beq	comp_return
+		tst.b	gather
+		beq	comp_1
 
-		neg.l	d0
-comp_return:
-		tst.l	d0
+		move.b	entry_mode(a1),d0
+		move.b	entry_mode(a0),d5
+		eor.b	d5,d0
+		and.b	#MODEVAL_DIR,d0
+		beq	comp_1
+
+		and.b	#MODEVAL_DIR,d5
+		rts
+
+comp_1:
+		jsr	(a2)
+		slt	d0
+		tst.b	reverse
+		bne	comp_reverse
+
+		tst.b	d0
+		rts
+
+comp_reverse:
+		not.b	d0
 		rts
 ****************************************************************
 * suffix2 - ファイル名の拡張子部のアドレス
@@ -2679,7 +2761,7 @@ too_long_path:
 .data
 
 	dc.b	0
-	dc.b	'## ls 1.1 ##  Copyright(C)1992 by Itagaki Fumihiko',0
+	dc.b	'## ls 1.2 ##  Copyright(C)1992-93 by Itagaki Fumihiko',0
 
 **
 **  定数
@@ -2713,7 +2795,7 @@ msg_bad_arg:			dc.b	'引数が正しくありません',0
 msg_bad_width:			dc.b	'幅の指定が正しくありません',0
 msg_too_few_args:		dc.b	'引数が足りません',0
 msg_usage:			dc.b	CR,LF
-				dc.b	'使用法:  ls [-1ABCDFLQRSUXabdeflmpqrstvx] [-w <幅>] [-] [<ファイル>] ...'
+				dc.b	'使用法:  ls [-1ABCDFGLQRSUVXabdeflmpqrstvx] [-w <幅>] [--] [<ファイル>] ...'
 str_newline:			dc.b	CR,LF,0
 default_arg:			dc.b	'.',0
 str_dotX:			dc.b	'.X',0
@@ -2738,6 +2820,7 @@ replace_link:		dc.b	0	*  -L
 directory:		dc.b	0	*  -d
 fast:			dc.b	0	*  -f
 reverse:		dc.b	0	*  -r
+gather:			dc.b	0	*  -G
 case_insensitive:	dc.b	0	*  -D
 print_nblocks:		dc.b	0	*  -s
 mark_dirs:		dc.b	0	*  -p
@@ -2745,6 +2828,7 @@ mark_exes:		dc.b	0	*  -F
 show_almost_all:	dc.b	0	*  -Aa
 show_all:		dc.b	0	*  -a
 not_show_backfiles:	dc.b	0	*  -B
+virtual_dir_size:	dc.b	0	*  -V
 *****************************************************************
 .bss
 
@@ -2781,15 +2865,12 @@ _linebuf:		ds.b	LINEBUFSIZE
 .even
 fatchkbuf:		ds.b	2+8*FATCHK_STATIC+4
 .even
-			ds.b	4096
-			*  スタックのマージンとして 4096バイトを確保しておく．
-			*  このプログラムでは 4096バイトあれば充分である．
-			*  （lndrv が 1.5KB程喰う可能性がある）
+		ds.b	16384
+		*  マージンとスーパーバイザ・スタックとを兼ねて16KB確保しておく．
 stack_lower:
-			ds.b	LS_RECURSE_STACKSIZE*(MAXRECURSE+1)
-			*  必要なスタック量は，再帰の度に消費されるスタック量と
-			*  その回数とで決まる．
-			ds.b	16
+		ds.b	LS_RECURSE_STACKSIZE*(MAXRECURSE+1)
+		*  必要なスタック量は，再帰の度に消費されるスタック量とその回数とで決まる．
+		ds.b	16
 .even
 stack_bottom:
 *****************************************************************
