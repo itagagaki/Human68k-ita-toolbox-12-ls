@@ -1,0 +1,6 @@
+MANIFEST       このファイル
+README         まず最初にお読み下さい
+NOTICE         版権と許諾についての告示書
+CHANGES        lsのモデルチェンジの履歴
+ls.1           lsのマニュアル
+ls.x           ls実行ファイル

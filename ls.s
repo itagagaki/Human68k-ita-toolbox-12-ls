@@ -29,8 +29,17 @@
 * Itagaki Fumihiko 04-Jan-94  TwentyOne +R に対応
 * Itagaki Fumihiko 04-Feb-94  ソートの比較が符号付きになっていたのを符号無しに修正
 * 1.4
+* Itagaki Fumihiko 23-Dec-94  存在しないドライブはエラーになるようにした
+* Itagaki Fumihiko 23-Dec-94  v1.3 で追加した『引数の末尾に / が付いていれば，それがディ
+*                             レクトリへのシンボリック・リンクであるときに，-l オプション
+*                             や -v オプションが指定されていてもディレクトリ引数として処
+*                             理する』機能が，-p オプションか -F オプションが指定されてい
+*                             ないと効かない不具合を修正
+* Itagaki Fumihiko 23-Dec-94  -P オプションを追加
+* Itagaki Fumihiko 23-Dec-94  -E オプションを追加
+* 1.5
 *
-* Usage: ls [ -1ABCDFGLQRSUVXabdeflmpqrstvx ] [ -w cols ] [ -- ] [ file ] ...
+* Usage: ls [ -1ABCDEFGLPQRSUVXabdeflmpqrstvx ] [ -w cols ] [ -- ] [ file ] ...
 *
 * オプションを追加するときは注意が必要，
 * あちらこちらでフラグをチェックして、無駄な処理を省いている．
@@ -54,6 +63,7 @@
 .xref stricmp
 .xref strcpy
 .xref stpcpy
+.xref strchr
 .xref strbot
 .xref strfor1
 .xref memmovi
@@ -89,8 +99,8 @@ FATCHK_STATIC	equ	256	*  静的バッファでfatchkできるようにしておくFATチェイン数
 entry_name:	ds.b	MAXPATH+1
 entry_flag:	ds.b	1
 entry_mode:	ds.b	1
-entry_linkmode:	ds.b	1
 .even
+entry_linkmode:	ds.w	1
 entry_drive:	ds.w	1
 entry_datime:
 entry_date:	ds.w	1
@@ -195,6 +205,7 @@ columns_ok:
 		moveq	#0,d1				*  -1
 		moveq	#1,d0				*  出力は
 		bsr	is_chrdev			*  ブロック・デバイスか？
+		sne	output_is_chrdev
 		beq	set_default_format		*  -- ブロック・デバイスである
 
 		moveq	#1,d1				*  -C
@@ -295,8 +306,14 @@ decode_opt_loop2:
 		cmp.b	#'p',d0
 		beq	opt_p
 
+		cmp.b	#'P',d0
+		beq	opt_P
+
 		cmp.b	#'F',d0
 		beq	opt_F
+
+		cmp.b	#'E',d0
+		beq	opt_E
 
 		moveq	#1,d1
 		cmp.b	#'q',d0
@@ -438,8 +455,16 @@ opt_d:
 
 opt_F:
 		st	mark_exes
+		bra	opt_p
+
+opt_P:
+		st	mark_links
 opt_p:
 		st	mark_dirs
+		bra	set_option_done
+
+opt_E:
+		st	color
 		bra	set_option_done
 
 opt_D:
@@ -466,6 +491,7 @@ set_option_done:
 		bra	decode_opt_loop1
 
 decode_opt_done:
+		movea.l	a0,a1
 	*
 	*  -fオプションの処理
 	*
@@ -481,6 +507,7 @@ decode_opt_done:
 		sf	replace_link
 		sf	print_nblocks
 		sf	mark_dirs
+		sf	color
 		sf	long_format
 fast_flag_ok:
 	*
@@ -503,10 +530,60 @@ fast_flag_ok:
 		sne	needs_dots_stat
 needs_dots_stat_ok:
 	*
+	*  -lオプションの処理
+	*
+		tst.b	long_format
+		beq	long_format_ok
+
+		sf	mark_links
+long_format_ok:
+	*
+	*  -Eオプションの処理
+	*
+		tst.b	color
+		beq	color_ok
+
+		tst.b	output_is_chrdev
+		beq	unset_color
+
+		lea	word_LSCOLORS(pc),a0
+		bsr	getenv
+		beq	color_ok
+
+		movea.l	d0,a0
+		bsr	strlen
+		addq.l	#1,d0
+		bsr	malloc
+		bmi	insufficient_memory
+
+		move.l	a1,-(a7)
+		movea.l	a0,a1
+		movea.l	d0,a0
+		bsr	strcpy
+		lea	colors(pc),a1
+		moveq	#3,d1
+set_color_loop:
+		move.l	a0,(a1)+
+		moveq	#':',d0
+		bsr	strchr
+		beq	set_color_continue
+
+		clr.b	(a0)+
+set_color_continue:
+		dbra	d1,set_color_loop
+
+		movea.l	(a7)+,a1
+		bra	color_ok
+
+unset_color:
+		sf	color
+color_ok:
+	*
 	*  -L の効果をチェックする
 	*
 		move.b	needs_dots_stat,d0
 		or.b	mark_dirs,d0
+		or.b	color,d0
 		or.b	recurse,d0
 		bne	replace_link_ok
 
@@ -526,14 +603,14 @@ virtual_dir_size_ok:
 	*
 	*  ファイル引数を検査する
 	*
-		lea	_linebuf(pc),a1
-		move.l	a1,_bufp
+		lea	_linebuf(pc),a0
+		move.l	a0,_bufp
 		move.l	#LINEBUFSIZE,_buf_remain
 
 		tst.l	d7
 		bne	args_ok
 
-		lea	default_arg(pc),a0
+		lea	default_arg(pc),a1
 		moveq	#1,d7
 args_ok:
 	*
@@ -545,11 +622,10 @@ args_ok:
 		clr.l	number_of_subdir
 		st	have_to_headtail
 ls_args_loop:
-		movea.l	a0,a1
+		movea.l	a1,a0
 		bsr	strfor1
 		exg	a0,a1
 		bsr	doname
-		movea.l	a1,a0
 		subq.l	#1,d7
 		bne	ls_args_loop
 	*
@@ -795,10 +871,7 @@ doname_lstat:
 		beq	doname_nostat
 doname_nofile:
 		movea.l	a5,a0
-		bsr	werror_myname_and_msg
-		lea	msg_nofile(pc),a0
-		bsr	werror
-		move.w	#2,exitcode
+		bsr	nofile
 		bra	doname_return
 
 doname_nostat:
@@ -829,7 +902,10 @@ doname_done:
 		*  ただし -l, -v オプションが指定されているときには，ファイル引数の末尾に /
 		*  が付いていなければsubdirをONにしない
 		*
-		btst.b	#MODEBIT_DIR,entry_linkmode(a1)
+		move.w	entry_linkmode(a1),d0
+		bmi	doname_return
+
+		btst	#MODEBIT_DIR,d0
 		beq	doname_return
 
 		tst.b	long_format			*  -l, -v
@@ -869,10 +945,10 @@ doname_too_long_path:
 *      スタックに注意．
 ****************************************************************
 ls_subdir:
-		movem.l	d0-d2/a0-a3,-(a7)
+		movem.l	d0-d3/a0-a4,-(a7)
 		lea	pathname(pc),a3
 		bsr	ls_subdir_recurse
-		movem.l	(a7)+,d0-d2/a0-a3
+		movem.l	(a7)+,d0-d3/a0-a4
 		rts
 ****************************************************************
 * ls_onedir - ディレクトリをオープンして表示する
@@ -883,7 +959,7 @@ ls_subdir:
 *                        最後に余計な / が付いていないこと
 *
 * RETURN
-*      すべて破壊
+*      D0-D3/A0-A4       破壊
 ****************************************************************
 ls_onedir:
 		clr.l	entry_top
@@ -893,6 +969,7 @@ ls_onedir:
 		movea.l	a0,a3
 		bsr	skip_root
 		exg	a0,a3
+		movea.l	a3,a4
 		beq	ls_onedir_head_ok
 
 		exg	a0,a3
@@ -901,8 +978,18 @@ ls_onedir:
 		move.l	a3,d0
 		sub.l	a0,d0
 		cmp.l	#MAXHEAD,d0
-		bhs	too_long_path
+		blo	ls_onedir_1
+too_long_path:
+			lea	msg_too_long_path(pc),a2
+error2:
+			bsr	werror_myname_and_msg
+			movea.l	a2,a0
+			bsr	werror
+			move.w	#2,exitcode
+			rts
 
+ls_onedir_1:
+		movea.l	a3,a4
 		move.b	#'/',(a3)+
 ls_onedir_head_ok:
 		lea	str_dos_allfile(pc),a1
@@ -948,10 +1035,18 @@ ls_onedir_head_ok:
 				*  というわけで，chdir方式は捨てた．
 				*
 				*  将来の Human68k では，このままでも速くなる可能性もある．
-open_directory_loop:
-		tst.l	d0
-		bmi	open_directory_done
+		cmp.l	#ENOFILE,d0
+		beq	open_directory_done
 
+		tst.l	d0
+		bpl	open_directory_loop
+
+			clr.b	(a4)
+nofile:
+			lea	msg_nofile(pc),a2
+			bra	error2
+
+open_directory_loop:
 		lea	ST_NAME(a2),a0
 		bsr	is_reldir
 		move.w	d0,d3
@@ -1033,8 +1128,8 @@ open_directory_continue:
 		move.l	a2,-(a7)
 		DOS	_NFILES
 		addq.l	#4,a7
-		bra	open_directory_loop
-
+		tst.l	d0
+		bpl	open_directory_loop
 open_directory_done:
 		tst.b	needs_nblocks
 		beq	ls_onedir_print_total_done
@@ -1127,11 +1222,11 @@ ls_subdir_header_ok:
 		cmpa.l	#stack_lower+24,a7		*  再帰に備えてスタックレベルをチェック
 		bhs	recurse_ok
 
+		move.l	a2,-(a7)
 		lea	pathname(pc),a0
-		bsr	werror_myname_and_msg
-		lea	msg_dir_too_deep(pc),a0
-		bsr	werror
-		move.w	#2,exitcode
+		lea	msg_dir_too_deep(pc),a2
+		bsr	error2
+		movea.l	(a7)+,a2
 		bra	ls_subdir_loop
 
 recurse_ok:
@@ -1258,7 +1353,7 @@ copy_stat:
 		swap	d0
 		move.l	d0,entry_datime(a1)
 		move.l	ST_SIZE(a2),entry_size(a1)
-		clr.b	entry_linkmode(a1)
+		move.w	#-1,entry_linkmode(a1)
 		rts
 *****************************************************************
 set_nostat:
@@ -1267,7 +1362,7 @@ set_nostat:
 		move.l	#OLDEST_DATIME,entry_datime(a1)
 		clr.l	entry_size(a1)
 		clr.l	entry_nblocks(a1)
-		clr.b	entry_linkmode(a1)
+		move.w	#-1,entry_linkmode(a1)
 		rts
 *****************************************************************
 lstat:
@@ -1313,21 +1408,32 @@ stat:
 *      A0     statとして採用したファイルのパス名の先頭アドレス
 *             static な領域なので注意すること
 *             ただし、set_nostat したときには 0
+*      D0   破壊
 *****************************************************************
 test_link_if_necessary:
 		tst.b	replace_link
-		bne	do_test_link
+		bne	do_test_link_0
+
+		tst.b	mark_links
+		bne	do_test_link_0
 
 		tst.b	long_format
 		beq	test_link_return
+do_test_link_0:
+		sf	d0
+		bra	do_test_link_1
+
 do_test_link:
+		st	d0
+do_test_link_1:
 		btst.b	#MODEBIT_LNK,entry_mode(a1)
 		beq	test_link_return
 
 		tst.l	lndrv
 		beq	test_link_return
 
-		movem.l	d1-d3/a2,-(a7)
+		movem.l	d1-d4/a2,-(a7)
+		move.b	d0,d4
 		tst.b	long_format			*  -l, -v
 		beq	chase_link_skip_malloc
 
@@ -1396,14 +1502,21 @@ chase_link_1:
 		movea.l	entry_linkpath(a1),a0
 		clr.b	(a0,d1.l)
 chase_link_readlink_done:
+		tst.b	d4
+		bne	stat_linkref
+
+		* ここで ( replace_link || mark_links || long_format ) == TRUE
+
 		tst.b	replace_link
 		bne	stat_linkref
 
-		tst.b	mark_dirs
+		tst.b	mark_links
 		bne	stat_linkref
 
-		tst.b	long_format
-		bne	test_link_done			*  参照パス名だけあれば良い
+		* ここで ( !replace_link && !mark_links && long_format ) == TRUE
+
+		tst.b	mark_dirs
+		beq	test_link_done			*  参照パス名だけあれば良い
 stat_linkref:
 		*  参照ファイルのstatを得る
 		tst.l	d2				*  getrealpathは成功したか？
@@ -1441,6 +1554,7 @@ stat_linkref_name_ok:
 
 do_replace_link:
 		lea	tmp_filesbuf(pc),a2
+		moveq	#0,d0
 		move.b	ST_MODE(a2),d0
 		btst	#MODEBIT_LNK,d0
 		bne	set_linkref_mode
@@ -1461,10 +1575,10 @@ get_linkref_mode:
 
 		moveq	#MODEVAL_DIR,d0
 set_linkref_mode:
-		move.b	d0,entry_linkmode(a1)
+		move.w	d0,entry_linkmode(a1)
 test_link_done:
 		movea.l	d3,a0
-		movem.l	(a7)+,d1-d3/a2
+		movem.l	(a7)+,d1-d4/a2
 test_link_return:
 		rts
 
@@ -1813,12 +1927,16 @@ output_multi_column_loop_x:
 		move.l	(a7)+,d3
 		addq.l	#5,d1
 output_multi_column_size_ok:
+		movem.l	d6-d7,-(a7)
 		lea	entry_name(a3),a0
+		moveq	#0,d6
+		move.b	entry_mode(a3),d6
 		bsr	print_name
 		add.l	d0,d1
-		move.b	entry_mode(a3),d0
+		move.w	entry_linkmode(a3),d7
 		bsr	print_mark
 		add.l	d0,d1
+		movem.l	(a7)+,d6-d7
 		sub.l	d6,d1
 		bhs	output_multi_column_continue_x
 
@@ -2012,16 +2130,17 @@ print_long_datime_year_1:
 		bsr	bufprint_02u
 long_format_misc_ok:
 		lea	entry_name(a3),a0
+		moveq	#0,d6
+		move.b	entry_mode(a3),d6
 		bsr	print_name
-		move.b	entry_mode(a3),d0
 		move.l	entry_linkpath(a3),d1
 		beq	long_format_link_ok
 
 		lea	str_arrow(pc),a1
 		bsr	bufcpy
 		movea.l	d1,a0
+		move.w	entry_linkmode(a3),d6
 		bsr	print_name
-		move.b	entry_linkmode(a3),d0
 long_format_link_ok:
 		bsr	print_mark
 		bsr	putline
@@ -2087,9 +2206,11 @@ do_output_inline:
 		addq.l	#1,d3
 output_inline_size_ok:
 		lea	entry_name(a3),a0
+		moveq	#0,d6
+		move.b	entry_mode(a3),d6
 		bsr	print_name
 		add.l	d0,d3
-		move.b	entry_mode(a3),d0
+		move.w	entry_linkmode(a3),d7
 		bsr	print_mark
 		add.l	d0,d3
 		tst.l	d2
@@ -2138,15 +2259,42 @@ bufprint_04u:
 *
 * CALL
 *      A0     ファイル名
+*      D6.W   mode
 *
 * RETURN
 *      D0.L   出力した桁幅
+*      D6.W   mode
 ****************************************************************
 print_name:
-		movem.l	d1-d4/a0-a1,-(a7)
-		movea.l	a0,a1
+		movem.l	d1-d4/a0-a2,-(a7)
 		moveq	#0,d1
 		bsr	doquote
+		tst.b	color
+		beq	print_name_1
+
+		tst.w	d6
+		bmi	print_name_set_color_0
+
+		lea	colors+12(pc),a2
+		btst	#MODEBIT_LNK,d6
+		bne	print_name_set_color
+
+		subq.l	#8,a2
+		btst	#MODEBIT_DIR,d6
+		bne	print_name_set_color
+
+		addq.l	#4,a2
+		movem.l	d1,-(a7)
+		bsr	check_exec
+		movem.l	(a7)+,d1
+		bne	print_name_set_color
+print_name_set_color_0:
+		lea	colors(pc),a2
+print_name_set_color:
+		move.l	(a2),a1
+		bsr	bufcpy
+print_name_1:
+		movea.l	a0,a1
 print_name_loop:
 		moveq	#0,d0
 		move.b	(a1)+,d0
@@ -2204,17 +2352,25 @@ print_name_graph:
 		bra	print_name_loop
 
 print_name_done:
+		tst.b	color
+		beq	print_name_done_1
+
+		lea	str_default_color(pc),a1
+		bsr	bufcpy
+print_name_done_1:
 		bsr	doquote
 		move.l	d1,d0
-		movem.l	(a7)+,d1-d4/a0-a1
+		movem.l	(a7)+,d1-d4/a0-a2
 		rts
 
 doquote:
 		tst.b	quote
 		beq	doquote_return
 
+		move.l	d0,-(a7)
 		moveq	#'"',d0
 		bsr	bufout
+		move.l	(a7)+,d0
 		addq.l	#1,d1
 doquote_return:
 		rts
@@ -2223,57 +2379,95 @@ doquote_return:
 *
 * CALL
 *      A0     ファイル名
-*      D0.B   mode
+*      D6.B   mode
+*      D7.W   linkmode
 *
 * RETURN
 *      D0.L   出力した桁幅
+*      D6.B   mode
 ****************************************************************
 print_mark:
-		movem.l	d1-d2/a1,-(a7)
-		move.b	d0,d1
-		btst	#MODEBIT_LNK,d1
+		tst.w	d6
+		bmi	print_mark_return_0
+
+		btst	#MODEBIT_LNK,d6
 		beq	print_mark_not_link
 
 		tst.b	mark_dirs
 		beq	print_mark_return_0
 
-		moveq	#'@',d2
-		bra	print_mark_add_return
+		tst.b	mark_links
+		beq	print_mark_link
+
+		moveq	#'&',d0
+		tst.w	d7
+		bmi	print_mark_put
+
+		btst	#MODEBIT_LNK,d7
+		bne	print_mark_put
+
+		moveq	#'>',d0
+		btst	#MODEBIT_DIR,d7
+		bne	print_mark_put
+print_mark_link:
+		moveq	#'@',d0
+		bra	print_mark_put
 
 print_mark_not_link:
 		tst.b	mark_dirs
 		beq	print_mark_return_0
 
-		moveq	#'/',d2
-		btst	#MODEBIT_DIR,d1
-		bne	print_mark_add_return
+		moveq	#'/',d0
+		btst	#MODEBIT_DIR,d6
+		bne	print_mark_put
 
 		tst.b	mark_exes
 		beq	print_mark_return_0
 
-		moveq	#'*',d2
-		btst	#MODEBIT_EXE,d1
-		bne	print_mark_add_return
+		movem.l	d1/a1,-(a7)
+		bsr	check_exec
+		movem.l	(a7)+,d1/a1
+		beq	print_mark_return_0
+
+		moveq	#'*',d0
+print_mark_put:
+		bsr	bufout
+		moveq	#1,d0
+		rts
+
+print_mark_return_0:
+		moveq	#0,d0
+		rts
+****************************************************************
+* check_exec
+*
+* CALL
+*      D6.B   mode
+*      A0     ファイル名
+*
+* RETURN
+*      CCR    実行可能なら NE
+*      D6.B   mode
+*      D0-D1/A1   破壊
+****************************************************************
+check_exec_true:
+		bset	#MODEBIT_EXE,d6
+check_exec:
+		btst	#MODEBIT_EXE,d6
+		bne	check_exec_return
 
 		bsr	strlen
 		moveq	#2,d1
 		lea	str_dotX(pc),a1
 		bsr	tailmatch
-		beq	print_mark_add_return
+		beq	check_exec_true
 
 		lea	str_dotR(pc),a1
 		bsr	tailmatch
-		bne	print_mark_return_0
-print_mark_add_return:
-		move.b	d2,d0
-		bsr	bufout
-		moveq	#1,d0
-		bra	print_mark_return
+		beq	check_exec_true
 
-print_mark_return_0:
-		moveq	#0,d0
-print_mark_return:
-		movem.l	(a7)+,d1-d2/a1
+		cmp.w	d0,d0
+check_exec_return:
 		rts
 ****************************************************************
 bufprintfu:
@@ -2786,19 +2980,10 @@ werror:
 		move.l	(a7)+,d0
 		rts
 *****************************************************************
-too_long_path:
-		bsr	werror_myname_and_msg
-		move.l	a0,-(a7)
-		lea	msg_too_long_path(pc),a0
-		bsr	werror
-		movea.l	(a7)+,a0
-		move.w	#2,exitcode
-		rts
-*****************************************************************
 .data
 
 	dc.b	0
-	dc.b	'## ls 1.4 ##  Copyright(C)1992-94 by Itagaki Fumihiko',0
+	dc.b	'## ls 1.5 ##  Copyright(C)1992-94 by Itagaki Fumihiko',0
 
 msg_myname:			dc.b	'ls: ',0
 msg_dos_version_mismatch:	dc.b	'バージョン2.00以降のHuman68kが必要です',CR,LF,0
@@ -2810,7 +2995,7 @@ msg_illegal_option:		dc.b	'不正なオプション -- ',0
 msg_bad_width:			dc.b	'幅の指定が正しくありません',0
 msg_too_few_args:		dc.b	'引数が足りません',0
 msg_usage:			dc.b	CR,LF
-				dc.b	'使用法:  ls [-1ABCDFGLQRSUVXabdeflmpqrstvx] [-w <幅>] [--] [<ファイル>] ...'
+				dc.b	'使用法:  ls [-1ABCDEFGLPQRSUVXabdeflmpqrstvx] [-w <幅>] [--] [<ファイル>] ...'
 str_newline:			dc.b	CR,LF,0
 default_arg:			dc.b	'.',0
 str_dotX:			dc.b	'.X',0
@@ -2820,7 +3005,12 @@ str_tilde:			dc.b	'~',0
 str_dos_allfile:		dc.b	'*.*',0
 str_total:			dc.b	'total ',0
 str_arrow:			dc.b	' -> ',0
+str_default_color:		dc.b	ESC,'[m',0
+str_cyan_color:			dc.b	ESC,'[31m',0
+str_yellow_color:		dc.b	ESC,'[32m',0
+str_reverse_color:		dc.b	ESC,'[43m',0
 word_COLUMNS:			dc.b	'COLUMNS',0
+word_LSCOLORS:			dc.b	'LSCOLORS',0
 
 assign_call_buffer:		dc.b	'?:',0
 
@@ -2845,6 +3035,10 @@ montab:
 **  変数
 **
 .even
+colors:			dc.l	str_default_color
+			dc.l	str_cyan_color
+			dc.l	str_yellow_color
+			dc.l	str_reverse_color
 long_format:		dc.b	0	*  -l
 long_datime:		dc.b	0	*  -v
 exploration:		dc.b	0	*  -e
@@ -2858,12 +3052,14 @@ reverse:		dc.b	0	*  -r
 gather:			dc.b	0	*  -G
 case_insensitive:	dc.b	0	*  -D
 print_nblocks:		dc.b	0	*  -s
-mark_dirs:		dc.b	0	*  -p
+mark_dirs:		dc.b	0	*  -pPF
 mark_exes:		dc.b	0	*  -F
+mark_links:		dc.b	0	*  -P
 show_almost_all:	dc.b	0	*  -Aa
 show_all:		dc.b	0	*  -a
 not_show_backfiles:	dc.b	0	*  -B
 virtual_dir_size:	dc.b	0	*  -V
+color:			dc.b	0	*  -E
 *****************************************************************
 .bss
 
@@ -2879,6 +3075,7 @@ _buf_remain:		ds.l	1
 cutoff_date:		ds.l	1
 present_date:		ds.w	1
 exitcode:		ds.w	1
+output_is_chrdev:	ds.b	1
 format:			ds.b	1	*  -1lCxm
 needs_dots_stat:	ds.b	1
 needs_nblocks:		ds.b	1
