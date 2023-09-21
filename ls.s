@@ -4,7 +4,7 @@
 * 1.0
 * Itagaki Fumihiko 06-Dec-92  Debug and brush up.
 * 1.1
-* Itagaki Fumihiko 08-Dec-92  ボリューム・ラベルのクラスタ数も正しく計数
+* Itagaki Fumihiko 08-Dec-92  ボリューム・ラベルのブロック数も正しく計数
 * Itagaki Fumihiko 16-Dec-92  / の最終更新時刻を 0-0-0 から 0-1-1 に変更
 * Itagaki Fumihiko 23-Dec-92  -V オプションの追加
 * Itagaki Fumihiko 10-Jan-93  GETPDB -> lea $10(a0),a0
@@ -19,6 +19,16 @@
 *                             リック・リンクであるときに，-l オプションや -v オプションが
 *                             指定されていてもディレクトリ引数として処理する
 * 1.3
+* Itagaki Fumihiko 03-Jan-94  lndrvが組み込まれていると，ls -ds . で . のブロックサイズが
+*                             0 と表示されてしまう不具合を修正
+* Itagaki Fumihiko 03-Jan-94  -w <幅> は -w<幅> と書いても良い
+* Itagaki Fumihiko 03-Jan-94  -V の処理の修正
+* Itagaki Fumihiko 03-Jan-94  -V の処理の高速化
+* Itagaki Fumihiko 04-Jan-94  引数に含まれるドライブ名を大文字に変換するのをやめた
+* Itagaki Fumihiko 04-Jan-94  引数に含まれる‘\’を‘/’に変換するのをやめた
+* Itagaki Fumihiko 04-Jan-94  TwentyOne +R に対応
+* Itagaki Fumihiko 04-Feb-94  ソートの比較が符号付きになっていたのを符号無しに修正
+* 1.4
 *
 * Usage: ls [ -1ABCDFGLQRSUVXabdeflmpqrstvx ] [ -w cols ] [ -- ] [ file ] ...
 *
@@ -36,12 +46,10 @@
 .xref DecodeHUPAIR
 .xref getlnenv
 .xref issjis
-.xref toupper
 .xref atou
 .xref utoa
 .xref utoao
 .xref strlen
-.xref strchr
 .xref strcmp
 .xref stricmp
 .xref strcpy
@@ -52,11 +60,12 @@
 .xref memset
 .xref mulul
 .xref divul
-.xref bsltosl
+.xref contains_dos_wildcard
 .xref strip_excessive_slashes
+.xref find_slashes
+.xref skip_root
 .xref headtail
 .xref suffix
-.xref contains_dos_wildcard
 .xref getenv
 .xref printfi
 
@@ -351,12 +360,14 @@ bad_option_1:
 		bra	usage
 
 parse_width:
-		tst.b	(a0)+
-		bne	bad_arg
+		tst.b	(a0)
+		bne	parse_width_1
 
 		subq.l	#1,d7
 		bcs	too_few_args
 
+		addq.l	#1,a0
+parse_width_1:
 		bsr	atou
 		bne	bad_width
 
@@ -473,7 +484,7 @@ decode_opt_done:
 		sf	long_format
 fast_flag_ok:
 	*
-	*  クラスタ・サイズを得る必要があるかどうか調べる
+	*  ブロック・サイズを得る必要があるかどうか調べる
 	*
 		move.b	print_nblocks,d0
 		or.b	long_format,d0
@@ -537,15 +548,6 @@ ls_args_loop:
 		movea.l	a0,a1
 		bsr	strfor1
 		exg	a0,a1
-		move.b	(a0),d0
-		beq	ls_args_1
-
-		cmpi.b	#':',1(a0)
-		bne	ls_args_1
-
-		bsr	toupper
-		move.b	d0,(a0)
-ls_args_1:
 		bsr	doname
 		movea.l	a1,a0
 		subq.l	#1,d7
@@ -633,15 +635,11 @@ exit_program:
 
 bad_width:
 		lea	msg_bad_width(pc),a0
-		bra	bad_arg_1
+		bra	werror_usage
 
 too_few_args:
 		lea	msg_too_few_args(pc),a0
-		bra	bad_arg_1
-
-bad_arg:
-		lea	msg_bad_arg(pc),a0
-bad_arg_1:
+werror_usage:
 		bsr	werror_myname_and_msg
 usage:
 		lea	msg_usage(pc),a0
@@ -672,14 +670,13 @@ doname:
 		movem.l	d1-d3/a0-a5,-(a7)
 		movea.l	a0,a5
 		sf	slash
-		bsr	bsltosl
 		bsr	strlen
 		subq.l	#1,d0
-		bcs	doname_0
+		bcs	doname_1
 
 		cmpi.b	#'/',(a0,d0.l)
 		seq	slash
-doname_0:
+doname_1:
 		bsr	strip_excessive_slashes
 		bsr	strlen
 		cmp.l	#MAXPATH,d0
@@ -689,12 +686,8 @@ doname_0:
 		bne	doname_nofile
 
 		tst.b	exploration
-		bne	doname_1
+		beq	doname_nameck_lstat
 
-		movea.l	a0,a1
-		bsr	lstat
-		bpl	doname_done
-doname_1:
 		movea.l	a0,a4
 		movea.l	a0,a2				*  A2 : pathname scanning pointer
 		lea	pathname(pc),a3			*  A3 : pathname appending pointer
@@ -702,35 +695,33 @@ doname_1:
 		cmpi.b	#':',1(a2)
 		bne	doname_drive_ok
 
-		move.b	(a2)+,(a3)+
-		move.b	(a2)+,(a3)+
 		subq.l	#2,d2
 		bcs	doname_too_long_path
-doname_drive_ok:
-		cmpi.b	#'/',(a2)
-		bne	doname_root_ok
 
 		move.b	(a2)+,(a3)+
+		move.b	(a2)+,(a3)+
+doname_drive_ok:
+		cmpi.b	#'/',(a2)
+		beq	doname_dup_root
+
+		cmpi.b	#'\',(a2)
+		bne	doname_root_ok
+doname_dup_root:
 		subq.l	#1,d2
 		bcs	doname_too_long_path
-doname_root_ok:
-		clr.b	(a3)
-		lea	pathname(pc),a0
-		tst.b	(a0)
-		beq	doname_not_root
 
+		move.b	(a2)+,(a3)+
+doname_root_ok:
 		tst.b	(a2)
-		beq	doname_nostat
-doname_not_root:
+		beq	doname_nameck_lstat
+
+		clr.b	(a3)
 		movea.l	a4,a0
-		tst.b	exploration
-		beq	doname_try_nameck
 doname_loop:
 		move.l	a3,a4				*  A4 : pathname のファイル名部
 		move.l	d2,d3				*  D3.L : ここまでの残り容量
 		movea.l	a2,a0
-		moveq	#'/',d0
-		bsr	strchr
+		bsr	find_slashes
 		exg	a0,a2
 		move.b	(a2),d1
 		clr.b	(a2)
@@ -747,41 +738,8 @@ doname_loop:
 		move.b	d1,(a2)
 		lea	pathname(pc),a0
 		tst.w	d0
-		beq	doname_not_pseudo
+		bne	doname_exp_pseudo
 
-		tst.b	(a2)
-		bne	doname_continue			*  パスの途中の . や .. は検査しない
-doname_try_nameck:
-		lea	nameck_buffer(pc),a1
-		bsr	dirnameck
-		bmi	doname_nameck_fail		*  NAMECKできなかった .. 通常処理へ
-
-		exg	a0,a1
-		bsr	strip_excessive_slashes
-		bsr	lstat
-		exg	a0,a1
-		bpl	doname_done
-
-		tst.b	3(a1)
-		bne	doname_nofile
-doname_nostat:
-		bsr	add_entry
-		bsr	set_nostat
-		bsr	test_subdir_bit
-		bra	doname_return
-
-doname_nameck_fail:
-		tst.b	exploration
-		beq	doname_not_pseudo
-doname_nofile:
-		movea.l	a5,a0
-		bsr	werror_myname_and_msg
-		lea	msg_nofile(pc),a0
-		bsr	werror
-		move.w	#2,exitcode
-		bra	doname_return
-
-doname_not_pseudo:
 		bsr	lstat
 		bmi	doname_nofile
 
@@ -801,12 +759,53 @@ doname_not_pseudo:
 		movea.l	a0,a1
 		tst.b	(a2)
 		beq	doname_done
+		bra	doname_continue
+
+doname_exp_pseudo:
+		tst.b	(a2)
+		beq	doname_nameck_lstat
 doname_continue:
 		subq.l	#1,d2
 		bcs	doname_too_long_path
 
 		move.b	(a2)+,(a3)+
 		bra	doname_loop
+
+doname_nameck_lstat:
+		lea	nameck_buffer(pc),a1
+		bsr	dirnameck
+		bpl	doname_lstat
+
+		movea.l	a0,a1
+doname_lstat:
+		exg	a0,a1
+		bsr	lstat
+		exg	a0,a1
+		bpl	doname_done
+
+		tst.b	(a1)
+		beq	doname_nofile
+
+		exg	a0,a1
+		move.l	a1,-(a7)
+		bsr	headtail
+		tst.b	(a1)
+		movea.l	(a7)+,a1
+		exg	a0,a1
+		beq	doname_nostat
+doname_nofile:
+		movea.l	a5,a0
+		bsr	werror_myname_and_msg
+		lea	msg_nofile(pc),a0
+		bsr	werror
+		move.w	#2,exitcode
+		bra	doname_return
+
+doname_nostat:
+		bsr	add_entry
+		bsr	set_nostat
+		bsr	test_subdir_bit
+		bra	doname_return
 
 doname_done:
 		move.l	a1,-(a7)
@@ -818,7 +817,7 @@ doname_done:
 		cmpa.l	#0,a0
 		beq	doname_return
 
-		bsr	set_cluster_size
+		bsr	set_block_size
 		*
 		*  引数がディレクトリならsubdirビットをONにする
 		*
@@ -892,27 +891,20 @@ ls_onedir:
 		clr.l	number_of_subdir
 		lea	pathname(pc),a0
 		movea.l	a0,a3
+		bsr	skip_root
+		exg	a0,a3
+		beq	ls_onedir_head_ok
+
+		exg	a0,a3
 		bsr	strbot
 		exg	a0,a3
 		move.l	a3,d0
 		sub.l	a0,d0
-		beq	ls_onedir_add_slash
-
-		cmpi.b	#':',-1(a3)
-		beq	ls_onedir_head_ok
-
-		cmpi.b	#'/',-1(a3)
-		beq	ls_onedir_head_ok
-ls_onedir_add_slash:
-		addq.l	#1,d0
 		cmp.l	#MAXHEAD,d0
-		bhi	too_long_path
+		bhs	too_long_path
 
 		move.b	#'/',(a3)+
 ls_onedir_head_ok:
-		cmp.l	#MAXHEAD,d0
-		bhi	too_long_path
-
 		lea	str_dos_allfile(pc),a1
 		exg	a0,a3
 		bsr	strcpy
@@ -1017,7 +1009,6 @@ backfile_ok:
 		bmi	ls_onedir_set_dots_nostat
 
 		lea	nameck_buffer(pc),a0
-		bsr	strip_excessive_slashes
 		bsr	lstat
 		bpl	ls_onedir_add_entry_replace_stat
 ls_onedir_set_dots_nostat:
@@ -1032,7 +1023,7 @@ ls_onedir_add_entry_copy_stat:
 		cmpa.l	#0,a0
 		beq	open_directory_continue
 
-		bsr	set_cluster_size
+		bsr	set_block_size
 		tst.w	d3				*  '.' か '..' か？
 		bne	open_directory_continue
 
@@ -1427,7 +1418,6 @@ stat_linkref:
 		bmi	stat_linkref_name_ok
 
 		movea.l	a1,a0
-		bsr	strip_excessive_slashes
 		tst.b	3(a0)
 		bne	stat_linkref_name_ok
 
@@ -1504,7 +1494,7 @@ test_subdir_bit:
 test_subdir_bit_ok:
 		rts
 *****************************************************************
-* set_cluster_size - 登録したENTRYのクラスタ数を求めてセットする
+* set_block_size - 登録したENTRYのブロック数を求めてセットする
 *
 * CALL
 *      A0     ファイルのパス名
@@ -1513,15 +1503,15 @@ test_subdir_bit_ok:
 * RETURN
 *      D0.L   破壊
 *****************************************************************
-set_cluster_size:
+set_block_size:
 		move.b	entry_mode(a1),d0
 		btst	#MODEBIT_DIR,d0
-		beq	set_cluster_size_1
+		beq	set_block_size_1
 
 		tst.b	virtual_dir_size
-		beq	set_cluster_size_1
+		beq	set_block_size_1
 
-		bsr	calc_true_cluster_size
+		bsr	calc_true_sector_size
 
 		move.l	d1,-(a7)
 		move.w	entry_drive(a1),d0
@@ -1533,7 +1523,8 @@ set_cluster_size:
 		DOS	_ASSIGN
 		lea	10(a7),a7
 		move.l	d0,d1
-		bmi	release_assign_done
+		cmp.l	#$60,d1
+		bne	release_assign_done
 
 		pea	assign_call_buffer(pc)
 		move.w	#4,-(a7)
@@ -1545,8 +1536,8 @@ release_assign_done:
 		DOS	_GETDPB
 		addq.l	#6,a7
 		exg	d0,d1
-		tst.l	d0
-		bmi	resume_assign_done
+		cmp.l	#$60,d0
+		bne	resume_assign_done
 
 		move.w	d0,-(a7)
 		pea	assign_result_buffer(pc)
@@ -1560,8 +1551,6 @@ resume_assign_done:
 
 		moveq	#0,d0
 		move.w	dpbbuf+2,d0
-		move.b	dpbbuf+5,d1
-		lsl.l	d1,d0
 		move.l	entry_nblocks(a1),d1
 		bsr	mulul
 		move.l	d0,entry_size(a1)
@@ -1569,20 +1558,20 @@ set_virtual_dir_size_done:
 		move.l	(a7)+,d1
 		rts
 
-set_cluster_size_1:
+set_block_size_1:
 		tst.b	needs_nblocks
-		beq	set_cluster_size_return
+		beq	set_block_size_return
 
 		and.b	#(MODEVAL_VOL|MODEVAL_DIR),d0
-		bne	calc_true_cluster_size
+		bne	calc_true_sector_size
 
 		move.l	entry_size(a1),d0
 		move.l	#BLOCKSIZE,d1
 		bsr	divul
 		addq.l	#1,d0
-		bra	do_set_cluster_size
+		bra	do_set_block_size
 
-calc_true_cluster_size:
+calc_true_sector_size:
 		movem.l	d1-d2/a2,-(a7)
 		moveq	#0,d2
 		lea	fatchkbuf(pc),a2
@@ -1626,27 +1615,27 @@ fatchk_malloc_ok:
 fatchk_success:
 		moveq	#0,d1
 		tst.l	d0
-		bmi	calc_cluster_size_done
+		bmi	calc_sector_size_done
 
 		move.w	(a2)+,entry_drive(a1)
-calc_cluster_size_loop:
+calc_sector_size_loop:
 		tst.l	(a2)+
-		beq	calc_cluster_size_done
+		beq	calc_sector_size_done
 
 		add.l	(a2)+,d1
-		bra	calc_cluster_size_loop
+		bra	calc_sector_size_loop
 
-calc_cluster_size_done:
+calc_sector_size_done:
 		move.l	d2,d0
-		beq	cluster_size_ok
+		beq	sector_size_ok
 
 		bsr	free
-cluster_size_ok:
+sector_size_ok:
 		move.l	d1,d0
 		movem.l	(a7)+,d1-d2/a2
-do_set_cluster_size:
+do_set_block_size:
 		move.l	d0,entry_nblocks(a1)
-set_cluster_size_return:
+set_block_size_return:
 		rts
 *****************************************************************
 * free_list - ENTRY構造体アドレス配列とすべてのENTRY構造体をfreeする
@@ -2076,7 +2065,7 @@ output_inline_3:
 
 		add.l	d3,d0
 		cmp.l	columns,d0
-		blt	do_output_inline
+		blo	do_output_inline
 
 		bsr	putline
 		moveq	#0,d3
@@ -2640,7 +2629,7 @@ comp:
 
 comp_1:
 		jsr	(a2)
-		slt	d0
+		slo	d0
 		tst.b	reverse
 		bne	comp_reverse
 
@@ -2773,6 +2762,9 @@ dirnameck:
 		tst.b	67(a1)
 		bne	dirnameck_return
 
+		exg	a0,a1
+		bsr	strip_excessive_slashes
+		exg	a0,a1
 		moveq	#0,d0
 dirnameck_return:
 		tst.l	d0
@@ -2806,11 +2798,32 @@ too_long_path:
 .data
 
 	dc.b	0
-	dc.b	'## ls 1.3 ##  Copyright(C)1992-93 by Itagaki Fumihiko',0
+	dc.b	'## ls 1.4 ##  Copyright(C)1992-94 by Itagaki Fumihiko',0
 
-**
-**  定数
-**
+msg_myname:			dc.b	'ls: ',0
+msg_dos_version_mismatch:	dc.b	'バージョン2.00以降のHuman68kが必要です',CR,LF,0
+msg_too_long_path:		dc.b	': パス名が長過ぎます',CR,LF,0
+msg_nofile:			dc.b	': このようなファイルやディレクトリはありません',CR,LF,0
+msg_dir_too_deep:		dc.b	': ディレクトリが深過ぎて処理できません',CR,LF,0
+msg_no_memory:			dc.b	'メモリが足りません',CR,LF,0
+msg_illegal_option:		dc.b	'不正なオプション -- ',0
+msg_bad_width:			dc.b	'幅の指定が正しくありません',0
+msg_too_few_args:		dc.b	'引数が足りません',0
+msg_usage:			dc.b	CR,LF
+				dc.b	'使用法:  ls [-1ABCDFGLQRSUVXabdeflmpqrstvx] [-w <幅>] [--] [<ファイル>] ...'
+str_newline:			dc.b	CR,LF,0
+default_arg:			dc.b	'.',0
+str_dotX:			dc.b	'.X',0
+str_dotR:			dc.b	'.R',0
+str_dotBAK:			dc.b	'.BAK',0
+str_tilde:			dc.b	'~',0
+str_dos_allfile:		dc.b	'*.*',0
+str_total:			dc.b	'total ',0
+str_arrow:			dc.b	' -> ',0
+word_COLUMNS:			dc.b	'COLUMNS',0
+
+assign_call_buffer:		dc.b	'?:',0
+
 montab:
 	dc.b	'  0',0
 	dc.b	'Jan',0
@@ -2828,31 +2841,6 @@ montab:
 	dc.b	' 13',0
 	dc.b	' 14',0
 	dc.b	' 15',0
-
-msg_myname:			dc.b	'ls: ',0
-msg_dos_version_mismatch:	dc.b	'バージョン2.00以降のHuman68kが必要です',CR,LF,0
-msg_too_long_path:		dc.b	': パス名が長過ぎます',CR,LF,0
-msg_nofile:			dc.b	': このようなファイルやディレクトリはありません',CR,LF,0
-msg_dir_too_deep:		dc.b	': ディレクトリが深過ぎて処理できません',CR,LF,0
-msg_no_memory:			dc.b	'メモリが足りません',CR,LF,0
-msg_illegal_option:		dc.b	'不正なオプション -- ',0
-msg_bad_arg:			dc.b	'引数が正しくありません',0
-msg_bad_width:			dc.b	'幅の指定が正しくありません',0
-msg_too_few_args:		dc.b	'引数が足りません',0
-msg_usage:			dc.b	CR,LF
-				dc.b	'使用法:  ls [-1ABCDFGLQRSUVXabdeflmpqrstvx] [-w <幅>] [--] [<ファイル>] ...'
-str_newline:			dc.b	CR,LF,0
-default_arg:			dc.b	'.',0
-str_dotX:			dc.b	'.X',0
-str_dotR:			dc.b	'.R',0
-str_dotBAK:			dc.b	'.BAK',0
-str_tilde:			dc.b	'~',0
-str_dos_allfile:		dc.b	'*.*',0
-str_total:			dc.b	'total ',0
-str_arrow:			dc.b	' -> ',0
-word_COLUMNS:			dc.b	'COLUMNS',0
-
-assign_call_buffer:		dc.b	'?:',0
 **
 **  変数
 **
