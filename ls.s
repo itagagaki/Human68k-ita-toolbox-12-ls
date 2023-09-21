@@ -2,10 +2,8 @@
 *
 * Itagaki Fumihiko 03-Dec-92  Create.
 * 1.0
-*
 * Itagaki Fumihiko 06-Dec-92  Debug and brush up.
 * 1.1
-*
 * Itagaki Fumihiko 08-Dec-92  ボリューム・ラベルのクラスタ数も正しく計数
 * Itagaki Fumihiko 16-Dec-92  / の最終更新時刻を 0-0-0 から 0-1-1 に変更
 * Itagaki Fumihiko 23-Dec-92  -V オプションの追加
@@ -13,11 +11,21 @@
 * Itagaki Fumihiko 20-Jan-93  引数 - と -- の扱いの変更
 * Itagaki Fumihiko 22-Jan-93  スタックを拡張
 * 1.2
+* Itagaki Fumihiko 04-Feb-93  LNDRV_realpathcpy->LNDRV_O_FILES を LNDRV_LINK_FILES に変更
+* Itagaki Fumihiko 06-Feb-93  JOINされたドライブ内のサブディレクトリにも-Vが効くよう修正
+* Itagaki Fumihiko 06-Feb-93  相対パスで設定されたシンボリック・リンクも正しく処理
+* Itagaki Fumihiko 06-Feb-93  ループしたシンボリック・リンクも正しく処理
+* Itagaki Fumihiko 07-Feb-93  引数の末尾に / が付いていれば，それがディレクトリへのシンボ
+*                             リック・リンクであるときに，-l オプションや -v オプションが
+*                             指定されていてもディレクトリ引数として処理する
+* 1.3
 *
 * Usage: ls [ -1ABCDFGLQRSUVXabdeflmpqrstvx ] [ -w cols ] [ -- ] [ file ] ...
 *
-* オプションを追加するときは注意が必要。
-* あちらこちらでフラグをチェックして、無駄な処理を省いている。
+* オプションを追加するときは注意が必要，
+* あちらこちらでフラグをチェックして、無駄な処理を省いている．
+*
+* 動いているものは覚悟していじるべし．
 
 .include doscall.h
 .include error.h
@@ -538,8 +546,6 @@ ls_args_loop:
 		bsr	toupper
 		move.b	d0,(a0)
 ls_args_1:
-		bsr	strip_excessive_slashes
-		bsr	bsltosl
 		bsr	doname
 		movea.l	a1,a0
 		subq.l	#1,d7
@@ -665,7 +671,16 @@ error_exit_3:
 doname:
 		movem.l	d1-d3/a0-a5,-(a7)
 		movea.l	a0,a5
-		moveq	#-1,d0
+		sf	slash
+		bsr	bsltosl
+		bsr	strlen
+		subq.l	#1,d0
+		bcs	doname_0
+
+		cmpi.b	#'/',(a0,d0.l)
+		seq	slash
+doname_0:
+		bsr	strip_excessive_slashes
 		bsr	strlen
 		cmp.l	#MAXPATH,d0
 		bhi	doname_too_long_path
@@ -773,7 +788,7 @@ doname_not_pseudo:
 		movea.l	a4,a3
 		move.l	d3,d2
 		movea.l	a0,a4				*  A4 : 登録する名前の先頭
-		lea	tmp_filesbuf+30(pc),a0
+		lea	tmp_filesbuf+ST_NAME(pc),a0
 		bsr	strlen
 		sub.l	d0,d2
 		bcs	doname_too_long_path
@@ -810,13 +825,18 @@ doname_done:
 		btst.b	#MODEBIT_DIR,entry_mode(a1)
 		bne	doname_set_subdir_bit
 		*
-		*  -l, -v オプションが指定されていなければ
 		*  引数がディレクトリへのシンボリック・リンクのときもsubdirビットをONにする
 		*
-		tst.b	long_format			*  -l, -v
-		bne	doname_return
-
+		*  ただし -l, -v オプションが指定されているときには，ファイル引数の末尾に /
+		*  が付いていなければsubdirをONにしない
+		*
 		btst.b	#MODEBIT_DIR,entry_linkmode(a1)
+		beq	doname_return
+
+		tst.b	long_format			*  -l, -v
+		beq	doname_set_subdir_bit
+
+		tst.b	slash
 		beq	doname_return
 doname_set_subdir_bit:
 		bset.b	#FLAGBIT_SUBDIR,entry_flag(a1)
@@ -940,7 +960,7 @@ open_directory_loop:
 		tst.l	d0
 		bmi	open_directory_done
 
-		lea	30(a2),a0
+		lea	ST_NAME(a2),a0
 		bsr	is_reldir
 		move.w	d0,d3
 		tst.b	show_all
@@ -949,7 +969,7 @@ open_directory_loop:
 		tst.w	d3
 		bne	open_directory_continue
 
-		btst.b	#MODEBIT_VOL,21(a2)
+		btst.b	#MODEBIT_VOL,ST_MODE(a2)
 		bne	open_directory_continue
 
 		tst.b	show_almost_all
@@ -958,7 +978,7 @@ open_directory_loop:
 		cmpi.b	#'.',(a0)
 		beq	open_directory_continue
 
-		btst.b	#MODEBIT_HID,21(a2)
+		btst.b	#MODEBIT_HID,ST_MODE(a2)
 		bne	open_directory_continue
 hidden_ok:
 		tst.b	not_show_backfiles
@@ -1008,7 +1028,7 @@ ls_onedir_add_entry_replace_stat:
 		lea	tmp_filesbuf(pc),a2
 ls_onedir_add_entry_copy_stat:
 		bsr	copy_stat
-		bsr	test_link
+		bsr	test_link_if_necessary
 		cmpa.l	#0,a0
 		beq	open_directory_continue
 
@@ -1242,11 +1262,11 @@ add_entry_space_ok_2:
 		rts
 *****************************************************************
 copy_stat:
-		move.b	21(a2),entry_mode(a1)
-		move.l	22(a2),d0
+		move.b	ST_MODE(a2),entry_mode(a1)
+		move.l	ST_TIME(a2),d0
 		swap	d0
 		move.l	d0,entry_datime(a1)
-		move.l	26(a2),entry_size(a1)
+		move.l	ST_SIZE(a2),entry_size(a1)
 		clr.b	entry_linkmode(a1)
 		rts
 *****************************************************************
@@ -1261,39 +1281,28 @@ set_nostat:
 *****************************************************************
 lstat:
 		tst.l	lndrv
-		beq	lstat_normal
+		beq	stat
 
-		movem.l	d1-d7/a0-a6,-(a7)
+		movem.l	d1/a1,-(a7)
 		clr.l	-(a7)
 		DOS	_SUPER				*  スーパーバイザ・モードに切り換える
 		addq.l	#4,a7
 		move.l	d0,-(a7)			*  前の SSP の値
 		movea.l	lndrv,a1
-		movea.l	LNDRV_realpathcpy(a1),a1
-		move.l	a0,-(a7)
-		pea	lntmp_pathname(pc)
-		jsr	(a1)
-		addq.l	#8,a7
-		move.l	d0,d1
-		bmi	lstat_done
-
-		movea.l	lndrv,a1
-		movea.l	LNDRV_O_FILES(a1),a1
+		movea.l	LNDRV_LINK_FILES(a1),a1
 		move.w	#MODEVAL_ALL,-(a7)
-		pea	lntmp_pathname(pc)
+		move.l	a0,-(a7)
 		pea	tmp_filesbuf(pc)
-		movea.l	a7,a6
 		jsr	(a1)
 		lea	10(a7),a7
 		move.l	d0,d1
-lstat_done:
 		DOS	_SUPER				*  ユーザ・モードに戻す
 		addq.l	#4,a7
 		move.l	d1,d0
-		movem.l	(a7)+,d1-d7/a0-a6
+		movem.l	(a7)+,d1/a1
 		rts
 
-lstat_normal:
+stat:
 		move.w	#MODEVAL_ALL,-(a7)
 		move.l	a0,-(a7)
 		pea	tmp_filesbuf(pc)
@@ -1302,7 +1311,8 @@ lstat_normal:
 		tst.l	d0
 		rts
 *****************************************************************
-* test_link - 登録したENTRYがシンボリック・リンクならば必要な処理を行う
+* test_link_if_necessary, do_test_link
+*      - 登録したENTRYがシンボリック・リンクならば必要な処理を行う
 *
 * CALL
 *      A0     ファイルのパス名
@@ -1313,7 +1323,7 @@ lstat_normal:
 *             static な領域なので注意すること
 *             ただし、set_nostat したときには 0
 *****************************************************************
-test_link:
+test_link_if_necessary:
 		tst.b	replace_link
 		bne	do_test_link
 
@@ -1326,149 +1336,156 @@ do_test_link:
 		tst.l	lndrv
 		beq	test_link_return
 
-		movem.l	d1-d3/a2-a3,-(a7)
+		movem.l	d1-d3/a2,-(a7)
+		tst.b	long_format			*  -l, -v
+		beq	chase_link_skip_malloc
+
 		move.l	entry_size(a1),d0
 		addq.l	#1,d0				*  +'\0'
 		bsr	malloc_slice
 		bmi	insufficient_memory
 
-		movea.l	d0,a3
-		movem.l	d2/d4-d7/a1/a3-a6,-(a7)
+		move.l	d0,entry_linkpath(a1)
+chase_link_skip_malloc:
 		clr.l	-(a7)
 		DOS	_SUPER				*  スーパーバイザ・モードに切り換える
 		addq.l	#4,a7
 		move.l	d0,-(a7)			*  前の SSP の値
+		tst.b	long_format			*  -l, -v
+		beq	chase_link_1
+
 		movea.l	lndrv,a2
 		movea.l	LNDRV_realpathcpy(a2),a2
 		move.l	a0,-(a7)
-		pea	lntmp_pathname(pc)
+		pea	chase_link_tmp_path(pc)
 		jsr	(a2)
 		addq.l	#8,a7
 		move.l	d0,d1
 		bmi	chase_link_1
 
+		movem.l	d4-d7/a0-a1/a3-a6,-(a7)
 		movea.l	lndrv,a2
 		movea.l	LNDRV_O_OPEN(a2),a2
 		clr.w	-(a7)
-		pea	lntmp_pathname(pc)
+		pea	chase_link_tmp_path(pc)
 		movea.l	a7,a6
 		jsr	(a2)
 		addq.l	#6,a7
 		move.l	d0,d1
+		movem.l	(a7)+,d4-d7/a0-a1/a3-a6
 chase_link_1:
+		movea.l	lndrv,a2
+		movea.l	LNDRV_getrealpath(a2),a2
+		move.l	a0,-(a7)
+		pea	chase_link_tmp_path(pc)
+		jsr	(a2)				*  参照ファイルのパス名を得る
+		addq.l	#8,a7
+		move.l	d0,d2				*  D2.L : getrealpathのstatus
 		DOS	_SUPER				*  ユーザ・モードに戻す
 		addq.l	#4,a7
-		movem.l	(a7)+,d2/d4-d7/a1/a3-a6
 		move.l	a0,d3
+		tst.b	long_format			*  -l, -v
+		beq	chase_link_readlink_done
+
 		tst.l	d1
 		bmi	chase_link_free_return
 
 		move.l	entry_size(a1),-(a7)
-		move.l	a3,-(a7)
+		move.l	entry_linkpath(a1),-(a7)
 		move.w	d1,-(a7)
 		DOS	_READ
 		lea	10(a7),a7
-		tst.l	d0
-		bmi	chase_link_free_return
-
 		exg	d0,d1
-		clr.b	(a3,d1.l)
 		move.w	d0,-(a7)
 		DOS	_CLOSE
 		addq.l	#2,a7
+		tst.l	d1
+		bmi	chase_link_free_return
+
+		movea.l	entry_linkpath(a1),a0
+		clr.b	(a0,d1.l)
+chase_link_readlink_done:
 		tst.b	replace_link
-		bne	nameck_linkref
+		bne	stat_linkref
 
 		tst.b	mark_dirs
-		bne	nameck_linkref
+		bne	stat_linkref
 
 		tst.b	long_format
-		bne	chase_link_done			*  参照パス名だけあれば良い
-nameck_linkref:
+		bne	test_link_done			*  参照パス名だけあれば良い
+stat_linkref:
+		*  参照ファイルのstatを得る
+		tst.l	d2				*  getrealpathは成功したか？
+		bmi	test_link_done
+
 		sf	d2
-		movea.l	a3,a0
-		bsr	strlen
-		cmp.l	#MAXPATH,d0
-		bhi	chase_link_name_ok		*  パス名が長過ぎるので，
-							*    tmp_pathname にコピーして
-							*    strip_excessive_slashes して
-							*    nameck
-							*  ができない．
-							*  
-							*  nofileと見なしてもいいのだが，
-							*  strip_excessive_slashes と nameck を
-							*  行わないで stat を取ってみる．
 		move.l	a1,-(a7)
-		movea.l	a3,a1
-		lea	tmp_pathname(pc),a0
-		bsr	strcpy
+		lea	chase_link_tmp_path(pc),a0
 		bsr	strip_excessive_slashes
 		lea	link_nameck_buffer(pc),a1
 		bsr	dirnameck
-		bmi	chase_link_nameck_done
+		bmi	stat_linkref_name_ok
 
 		movea.l	a1,a0
 		bsr	strip_excessive_slashes
 		tst.b	3(a0)
-		bne	chase_link_nameck_done
+		bne	stat_linkref_name_ok
 
-		st	d2
-chase_link_nameck_done:
+		st	d2				*  root directory
+stat_linkref_name_ok:
 		movea.l	(a7)+,a1
-chase_link_name_ok:
 		tst.b	replace_link
-		beq	test_link_get_mode
+		beq	get_linkref_mode
 
 		move.l	a0,d3
 		bsr	lstat
-		bpl	replace_link_stat_ok
+		bpl	do_replace_link
 
 		tst.b	d2
-		beq	chase_link_done
+		beq	test_link_done
 
 		bsr	set_nostat
 		bsr	test_subdir_bit
 		moveq	#0,d3
 		bra	chase_link_free_return
 
-replace_link_stat_ok:
+do_replace_link:
 		lea	tmp_filesbuf(pc),a2
-		move.b	21(a2),d0
+		move.b	ST_MODE(a2),d0
 		btst	#MODEBIT_LNK,d0
-		bne	chase_link_set_mode
+		bne	set_linkref_mode
 
 		bsr	copy_stat
 		bra	chase_link_free_return
 
-test_link_get_mode:
+get_linkref_mode:
 		move.w	#-1,-(a7)
 		move.l	a0,-(a7)
 		DOS	_CHMOD
 		addq.l	#6,a7
 		tst.l	d0
-		bpl	chase_link_set_mode
+		bpl	set_linkref_mode
 
 		tst.b	d2
-		beq	chase_link_done
+		beq	test_link_done
 
 		moveq	#MODEVAL_DIR,d0
-chase_link_set_mode:
+set_linkref_mode:
 		move.b	d0,entry_linkmode(a1)
-chase_link_done:
-		tst.b	long_format			*  -l, -v
-		beq	chase_link_free_return
-
-		move.l	a3,entry_linkpath(a1)
-		bra	test_link_done
-
-chase_link_free_return:
-		move.l	a3,d0
-		bsr	free
 test_link_done:
 		movea.l	d3,a0
-		movem.l	(a7)+,d1-d3/a2-a3
+		movem.l	(a7)+,d1-d3/a2
 test_link_return:
 		rts
+
+chase_link_free_return:
+		tst.b	long_format
+		beq	test_link_done
+
+		move.l	entry_linkpath(a1),d0
+		bsr	free
+		clr.l	entry_linkpath(a1)
+		bra	test_link_done
 *****************************************************************
 * test_subdir_bit - 登録したENTRYがディレクトリならばSUBDIRフラグをONにする
 *
@@ -1505,23 +1522,51 @@ set_cluster_size:
 		beq	set_cluster_size_1
 
 		bsr	calc_true_cluster_size
+
+		move.l	d1,-(a7)
+		move.w	entry_drive(a1),d0
+		add.b	#'A'-1,d0
+		move.b	d0,assign_call_buffer
+		pea	assign_result_buffer(pc)
+		pea	assign_call_buffer(pc)
+		clr.w	-(a7)
+		DOS	_ASSIGN
+		lea	10(a7),a7
+		move.l	d0,d1
+		bmi	release_assign_done
+
+		pea	assign_call_buffer(pc)
+		move.w	#4,-(a7)
+		DOS	_ASSIGN
+		addq.l	#6,a7
+release_assign_done:
 		pea	dpbbuf(pc)
 		move.w	entry_drive(a1),-(a7)
 		DOS	_GETDPB
 		addq.l	#6,a7
+		exg	d0,d1
 		tst.l	d0
+		bmi	resume_assign_done
+
+		move.w	d0,-(a7)
+		pea	assign_result_buffer(pc)
+		pea	assign_call_buffer(pc)
+		move.w	#1,-(a7)
+		DOS	_ASSIGN
+		lea.l	12(a7),a7
+resume_assign_done:
+		tst.l	d1
 		bmi	set_virtual_dir_size_done
 
-		move.l	d1,-(a7)
 		moveq	#0,d0
 		move.w	dpbbuf+2,d0
 		move.b	dpbbuf+5,d1
 		lsl.l	d1,d0
 		move.l	entry_nblocks(a1),d1
 		bsr	mulul
-		move.l	(a7)+,d1
 		move.l	d0,entry_size(a1)
 set_virtual_dir_size_done:
+		move.l	(a7)+,d1
 		rts
 
 set_cluster_size_1:
@@ -2761,7 +2806,7 @@ too_long_path:
 .data
 
 	dc.b	0
-	dc.b	'## ls 1.2 ##  Copyright(C)1992-93 by Itagaki Fumihiko',0
+	dc.b	'## ls 1.3 ##  Copyright(C)1992-93 by Itagaki Fumihiko',0
 
 **
 **  定数
@@ -2806,6 +2851,8 @@ str_dos_allfile:		dc.b	'*.*',0
 str_total:			dc.b	'total ',0
 str_arrow:			dc.b	' -> ',0
 word_COLUMNS:			dc.b	'COLUMNS',0
+
+assign_call_buffer:		dc.b	'?:',0
 **
 **  変数
 **
@@ -2849,6 +2896,7 @@ needs_dots_stat:	ds.b	1
 needs_nblocks:		ds.b	1
 print_dirheader:	ds.b	1
 have_to_headtail:	ds.b	1
+slash:			ds.b	1
 itoabuf:		ds.b	12
 .even
 filesbuf:		ds.b	STATBUFSIZE
@@ -2856,15 +2904,16 @@ filesbuf:		ds.b	STATBUFSIZE
 tmp_filesbuf:		ds.b	STATBUFSIZE
 .even
 dpbbuf:			ds.b	94
+assign_result_buffer:	ds.b	128
 nameck_buffer:		ds.b	91
 link_nameck_buffer:	ds.b	91
 pathname:		ds.b	MAXPATH+1
-tmp_pathname:		ds.b	MAXPATH+1
-lntmp_pathname:		ds.b	128
+chase_link_tmp_path:	ds.b	128
 _linebuf:		ds.b	LINEBUFSIZE
 .even
 fatchkbuf:		ds.b	2+8*FATCHK_STATIC+4
 .even
+
 		ds.b	16384
 		*  マージンとスーパーバイザ・スタックとを兼ねて16KB確保しておく．
 stack_lower:
