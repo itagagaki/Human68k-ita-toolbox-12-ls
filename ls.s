@@ -3,7 +3,13 @@
 * Itagaki Fumihiko 03-Dec-92  Create.
 * 1.0
 *
+* Itagaki Fumihiko 06-Dec-92  Debug and brush up.
+* 1.1
+*
 * Usage: ls [ -1ABCDFLQRSUXabdeflmpqrstvx ] [ -w cols ] [ - ] [ file ] ...
+*
+* オプションを追加するときは注意が必要。
+* あちらこちらでフラグをチェックして、無駄な処理を省いている。
 
 .include doscall.h
 .include error.h
@@ -73,7 +79,6 @@ FLAGBIT_SUBDIR	equ	0
 FLAGBIT_NOSTAT	equ	1
 FLAGBIT_IGNORE	equ	2
 FLAGBIT_ALLOC	equ	3
-FLAGBIT_EXEC	equ	4
 
 LNDRV_O_CREATE		equ	4*2
 LNDRV_O_OPEN		equ	4*3
@@ -171,6 +176,11 @@ set_default_format:
 		move.b	d1,format
 		lea	cmp_name(pc),a0
 		move.l	a0,cmp_func
+	*
+	*  lndrv常駐チェック
+	*
+		bsr	getlnenv
+		move.l	d0,lndrv
 	*
 	*  引数並び格納エリアを確保する
 	*
@@ -423,25 +433,37 @@ decode_opt_done:
 		sf	long_format
 fast_flag_ok:
 	*
-	*  シンボリック・リンクを追う必要があるかどうか調べる
+	*  クラスタ・サイズを得る必要があるかどうか調べる
 	*
-		bsr	getlnenv
-		move.l	d0,lndrv
-		beq	unset_chase_link	*  lndrv がいないなら、何をやってもムダ
+		move.b	print_nblocks,d0
+		or.b	long_format,d0
+		sne	needs_nblocks
+	*
+	*  ‘.’と‘..’の stat を得る必要があるかどうか調べる
+	*
+		st	needs_dots_stat
+		cmpi.l	#cmp_time,cmp_func
+		beq	needs_dots_stat_ok
 
-		st	chase_link
-		tst.b	mark_dirs		*  -p か -F が指定されているなら属性が必要
-		bne	chase_link_ok
+		cmpi.l	#cmp_size,cmp_func
+		beq	needs_dots_stat_ok
 
-		tst.b	long_format		*  -l か -v が指定されているなら名前が必要
-		bne	chase_link_ok
+		tst.b	needs_nblocks
+		sne	needs_dots_stat
+needs_dots_stat_ok:
+	*
+	*  -L の効果をチェックする
+	*
+		move.b	needs_dots_stat,d0
+		or.b	mark_dirs,d0
+		or.b	recurse,d0
+		bne	replace_link_ok
 
-		tst.b	replace_link		*  -L では，リンク先が存在するときは置き換え，
-		bne	chase_link_ok		*  そうでなければ -L が指定されてないときと同
-						*  じ処理を行う．
-unset_chase_link:
-		sf	chase_link
-chase_link_ok:
+		sf	replace_link			*  -L に効果は無い。退ける。
+replace_link_ok:
+	*
+	*  ファイル引数を検査する
+	*
 		lea	_linebuf(pc),a1
 		move.l	a1,_bufp
 		move.l	#LINEBUFSIZE,_buf_remain
@@ -687,6 +709,7 @@ doname_try_nameck:
 doname_nostat:
 		bsr	add_entry
 		bsr	set_nostat
+		bsr	test_subdir_bit
 		bra	doname_return
 
 doname_nameck_fail:
@@ -733,19 +756,22 @@ doname_done:
 		lea	tmp_filesbuf(pc),a2
 		bsr	copy_stat
 		move.l	(a7)+,a0
-		bsr	test_link
+		bsr	do_test_link
 		cmpa.l	#0,a0
 		beq	doname_return
 
 		bsr	set_cluster_size
+		*
+		*  引数がディレクトリならsubdirビットをONにする
+		*
 		btst.b	#MODEBIT_DIR,entry_mode(a1)
 		bne	doname_set_subdir_bit
-
+		*
+		*  -l, -v オプションが指定されていなければ
+		*  引数がディレクトリへのシンボリック・リンクのときもsubdirビットをONにする
+		*
 		tst.b	long_format			*  -l, -v
 		bne	doname_return
-
-		btst.b	#MODEBIT_LNK,entry_mode(a1)
-		beq	doname_return
 
 		btst.b	#MODEBIT_DIR,entry_linkmode(a1)
 		beq	doname_return
@@ -802,23 +828,25 @@ ls_onedir:
 		clr.l	number_of_entry
 		clr.l	number_of_subdir
 		lea	pathname(pc),a0
-		movea.l	a0,a1
+		movea.l	a0,a3
 		bsr	strbot
-		move.l	a0,d0
-		sub.l	a1,d0
+		exg	a0,a3
+		move.l	a3,d0
+		sub.l	a0,d0
 		beq	ls_onedir_add_slash
 
-		cmpi.b	#':',-1(a0)
+		cmpi.b	#':',-1(a3)
 		beq	ls_onedir_head_ok
 
-		cmpi.b	#'/',-1(a0)
+		cmpi.b	#'/',-1(a3)
 		beq	ls_onedir_head_ok
 ls_onedir_add_slash:
-		move.b	#'/',(a0)+
 		addq.l	#1,d0
+		cmp.l	#MAXHEAD,d0
+		bhi	too_long_path
+
+		move.b	#'/',(a3)+
 ls_onedir_head_ok:
-		movea.l	a0,a3
-		lea	pathname(pc),a0
 		cmp.l	#MAXHEAD,d0
 		bhi	too_long_path
 
@@ -832,6 +860,39 @@ ls_onedir_head_ok:
 		move.l	a2,-(a7)
 		DOS	_FILES
 		lea	10(a7),a7
+				*  chdir で降りながら files("*.*") する方が速いことが実験で
+				*  確かめられたが，速くなるとは言っても高々全体の5%程度であ
+				*  るし，条件によっては逆に遅くなることも考えられる．それに，
+				*
+				*  o ディレクトリへのシンボリック・リンクに降りると
+				*    chdir("..") では戻れないので，その場合はカレント・ディ
+				*    レクトリを保存しておく処理
+				*
+				*  o ディレクトリ引数の処理後はどこにも戻らない処理
+				*
+				*  o ^Cが押されたら作業ディレクトリに復帰してから終了する処
+				*    理
+				*
+				*  などを行わねばならず，プログラムが複雑になる．これらの処
+				*  理を‘必要な場合だけ’行うようにすると，プログラムはさら
+				*  に複雑になる．
+				*
+				*  また，‘ディレクトリへのシンボリック・リンク’のパス名で
+				*  も chdir できるという前提が，将来にわたって保証されないか
+				*  も知れない（気がしないでもない）．そもそも chdir は‘指定
+				*  ドライブのカレント・ディレクトリを変更する’ファンクショ
+				*  ンであるから，ドライブをまたがって chdir する lndrv 1.00
+				*  の仕様は，Human68k の本来の仕様から少々逸脱している．この
+				*  ような観点から，lndrv の chdir の仕様に依存するのは少々危
+				*  険と見た．ならば lndrv の chdir を直接は呼ばずに，目的の
+				*  ディレクトリのパス名を readlink により読み取って chdir す
+				*  れば良い（この処理は，このルーチンに到達するまでに既に行
+				*  われている筈であるから，時間的に損することはない）のだが，
+				*  それもまたプログラムを複雑にしてしまう．
+				*
+				*  というわけで，chdir方式は捨てた．
+				*
+				*  将来の Human68k では，このままでも速くなる可能性もある．
 open_directory_loop:
 		tst.l	d0
 		bmi	open_directory_done
@@ -879,24 +940,24 @@ backfile_ok:
 		bsr	strcpy
 		movea.l	a1,a0
 		bsr	add_entry
-		*
-		*  . と .. は nameck して再び stat を取得する
-		*
 		lea	pathname(pc),a0
 		tst.w	d3
 		beq	ls_onedir_add_entry_copy_stat
+
+		tst.b	needs_dots_stat
+		beq	ls_onedir_set_dots_nostat
 
 		move.l	a1,-(a7)
 		lea	nameck_buffer(pc),a1
 		bsr	dirnameck
 		movea.l	(a7)+,a1
-		bmi	ls_onedir_add_entry_copy_stat
+		bmi	ls_onedir_set_dots_nostat
 
 		lea	nameck_buffer(pc),a0
 		bsr	strip_excessive_slashes
 		bsr	lstat
 		bpl	ls_onedir_add_entry_replace_stat
-
+ls_onedir_set_dots_nostat:
 		bsr	set_nostat
 		bra	open_directory_continue
 
@@ -921,12 +982,9 @@ open_directory_continue:
 		bra	open_directory_loop
 
 open_directory_done:
-		tst.b	print_nblocks
-		bne	ls_onedir_calc_total
-
-		tst.b	long_format			*  -l, -v
+		tst.b	needs_nblocks
 		beq	ls_onedir_print_total_done
-ls_onedir_calc_total:
+
 		pea	str_total(pc)
 		DOS	_PRINT
 		addq.l	#4,a7
@@ -1078,16 +1136,17 @@ add_entry:
 		bsr	malloc
 		bmi	insufficient_memory
 
-		move.l	d0,entry_top
+		move.l	d0,d1
+		movea.l	d1,a0
 		move.l	a1,-(a7)
-		movea.l	d0,a0
 		movea.l	entry_top,a1
 		move.l	-8(a1),d0
 		sub.l	a1,d0
 		bsr	memmovi
+		movea.l	(a7)+,a1
 		move.l	entry_top,d0
 		bsr	free
-		movea.l	(a7)+,a1
+		move.l	d1,entry_top
 		bra	xrealloc_ok
 
 xrealloc_malloc:
@@ -1150,7 +1209,6 @@ copy_stat:
 *****************************************************************
 set_nostat:
 		move.b	#MODEVAL_DIR,entry_mode(a1)
-		bsr	test_subdir_bit
 		bset.b	#FLAGBIT_NOSTAT,entry_flag(a1)
 		clr.l	entry_datime(a1)
 		clr.l	entry_size(a1)
@@ -1213,21 +1271,26 @@ lstat_normal:
 *             ただし、set_nostat したときには 0
 *****************************************************************
 test_link:
-		movem.l	d1-d3/a2-a3,-(a7)
-		move.l	a0,d3
+		tst.b	replace_link
+		bne	do_test_link
+
+		tst.b	long_format
+		beq	test_link_return
+do_test_link:
 		btst.b	#MODEBIT_LNK,entry_mode(a1)
 		beq	test_link_return
 
-		tst.b	chase_link
+		tst.l	lndrv
 		beq	test_link_return
 
+		movem.l	d1-d3/a2-a3,-(a7)
 		move.l	entry_size(a1),d0
 		addq.l	#1,d0				*  +'\0'
 		bsr	malloc_slice
 		bmi	insufficient_memory
 
 		movea.l	d0,a3
-		movem.l	d2-d7/a1/a3-a6,-(a7)
+		movem.l	d2/d4-d7/a1/a3-a6,-(a7)
 		clr.l	-(a7)
 		DOS	_SUPER				*  スーパーバイザ・モードに切り換える
 		addq.l	#4,a7
@@ -1252,7 +1315,8 @@ test_link:
 chase_link_1:
 		DOS	_SUPER				*  ユーザ・モードに戻す
 		addq.l	#4,a7
-		movem.l	(a7)+,d2-d7/a1/a3-a6
+		movem.l	(a7)+,d2/d4-d7/a1/a3-a6
+		move.l	a0,d3
 		tst.l	d1
 		bmi	chase_link_free_return
 
@@ -1269,7 +1333,15 @@ chase_link_1:
 		move.w	d0,-(a7)
 		DOS	_CLOSE
 		addq.l	#2,a7
+		tst.b	replace_link
+		bne	nameck_linkref
 
+		tst.b	mark_dirs
+		bne	nameck_linkref
+
+		tst.b	long_format
+		bne	chase_link_done			*  参照パス名だけあれば良い
+nameck_linkref:
 		sf	d2
 		movea.l	a3,a0
 		bsr	strlen
@@ -1312,6 +1384,7 @@ chase_link_name_ok:
 		beq	chase_link_done
 
 		bsr	set_nostat
+		bsr	test_subdir_bit
 		moveq	#0,d3
 		bra	chase_link_free_return
 
@@ -1343,14 +1416,15 @@ chase_link_done:
 		beq	chase_link_free_return
 
 		move.l	a3,entry_linkpath(a1)
-		bra	test_link_return
+		bra	test_link_done
 
 chase_link_free_return:
 		move.l	a3,d0
 		bsr	free
-test_link_return:
+test_link_done:
 		movea.l	d3,a0
 		movem.l	(a7)+,d1-d3/a2-a3
+test_link_return:
 		rts
 *****************************************************************
 * test_subdir_bit - 登録したENTRYがディレクトリならばSUBDIRフラグをONにする
@@ -1380,12 +1454,9 @@ test_subdir_bit_ok:
 *      D0.L   破壊
 *****************************************************************
 set_cluster_size:
-		tst.b	print_nblocks			*  -s
-		bne	calc_cluster_size
-
-		tst.b	long_format			*  -l, -v
+		tst.b	needs_nblocks
 		beq	set_cluster_size_return
-calc_cluster_size:
+
 		btst.b	#MODEBIT_DIR,entry_mode(a1)
 		bne	calc_true_cluster_size
 
@@ -2606,6 +2677,10 @@ too_long_path:
 		rts
 *****************************************************************
 .data
+
+	dc.b	0
+	dc.b	'## ls 1.1 ##  Copyright(C)1992 by Itagaki Fumihiko',0
+
 **
 **  定数
 **
@@ -2686,7 +2761,8 @@ cutoff_date:		ds.l	1
 present_date:		ds.w	1
 exitcode:		ds.w	1
 format:			ds.b	1	*  -1lCxm
-chase_link:		ds.b	1
+needs_dots_stat:	ds.b	1
+needs_nblocks:		ds.b	1
 print_dirheader:	ds.b	1
 have_to_headtail:	ds.b	1
 itoabuf:		ds.b	12
